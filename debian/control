@@ -1,0 +1,12 @@
+Package: p3-fancurve
+Version: @VERSION@
+Architecture: all
+Maintainer: Erik Gonzalez <dev@gonzalezerik.com>
+Depends: python3, acpi-call-dkms
+Section: admin
+Priority: optional
+Homepage: https://github.com/gonzalezerik/p3-tiny-fancurve
+Description: Fan curve for the Lenovo ThinkStation P3 Tiny Gen 2
+ Switches the embedded controller between its quiet curve and full speed
+ based on CPU package temperature, using the firmware's runtime cooling-mode
+ WMI method, and reads fan RPM from EC RAM. Fails safe to full speed.

@@ -1,0 +1,11 @@
+[Unit]
+Description=ThinkStation P3 Tiny Gen 2 fan curve (EC cooling mode via WMI)
+After=systemd-modules-load.service
+
+[Service]
+ExecStart=@SBINDIR@/p3-fancurve run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

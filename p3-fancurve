@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Temperature-driven fan curve for the Lenovo ThinkStation P3 Tiny Gen 2.
+
+The fan is owned by the EC; Linux gets no PWM. The firmware does expose a
+runtime cooling-mode switch (WMI GUID 887B54F3-..., \\WMI2.WMG0 method 5),
+and the fan tach lives in EC RAM 0x09/0x0A.
+Both are reached through acpi_call so all EC access goes through the AML
+interpreter (no racing the firmware on ports 0x62/0x66).
+
+Measured 2026-10-10: "balance" and "performance" are both EC auto-curves that
+sit near ~900 rpm into the high 80s C; "full" is a fixed ~5970 rpm. No duty/PWM
+register is exposed (EC RAM and the 0xA50 bank only hold mode flags), so the
+curve is: EC quiet curve until UP_FULL, full speed until DOWN_BALANCE + HOLD.
+
+  p3-fancurve run      daemon (systemd)
+  p3-fancurve status   one-shot readout
+  p3-fancurve set {balance|performance|full}
+"""
+import os, signal, sys, time
+
+CALL = "/proc/acpi/call"
+PKG_TEMP = None  # resolved at start: thermal zone of type x86_pkg_temp
+LEVELS = {"balance": 2, "performance": 3, "full": 4}
+NAMES = {v: k for k, v in LEVELS.items()}
+
+# Go to full at >= UP_FULL; return to balance once below DOWN_BALANCE and full
+# has been held for HOLD seconds (keeps it from pumping every few seconds).
+CFG = {"UP_FULL": 80, "DOWN_BALANCE": 62, "HOLD": 300, "INTERVAL": 5}
+
+
+def load_cfg():
+    try:
+        for line in open("/etc/default/p3-fancurve"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() in CFG:
+                    CFG[k.strip()] = int(v.strip())
+    except FileNotFoundError:
+        pass
+
+
+def acpi(expr):
+    with open(CALL, "w") as f:
+        f.write(expr)
+    with open(CALL) as f:
+        out = f.read().strip("\0\n ")
+    if out.startswith("Error"):
+        raise RuntimeError(f"{expr}: {out}")
+    return int(out, 16) if out.startswith("0x") else int(out)
+
+
+def ec(addr):
+    return acpi(f"\\_SB.GECR 0x{addr:02x}")
+
+
+def rpm():
+    return (ec(0x0A) << 8) | ec(0x09)
+
+
+def get_mode():
+    return NAMES.get(acpi("\\WMI2.WMG0 0 6 0"), "unknown")
+
+
+def set_mode(name):
+    acpi(f"\\WMI2.WMG0 0 5 {LEVELS[name]}")
+
+
+def pkg_zone():
+    for z in sorted(os.listdir("/sys/class/thermal")):
+        p = f"/sys/class/thermal/{z}"
+        try:
+            if open(f"{p}/type").read().strip() == "x86_pkg_temp":
+                return f"{p}/temp"
+        except OSError:
+            continue
+    raise RuntimeError("no x86_pkg_temp thermal zone")
+
+
+def cpu_temp():
+    return int(open(PKG_TEMP).read()) / 1000
+
+
+def target(level, temp, held):
+    if temp >= CFG["UP_FULL"]:
+        return "full"
+    if level == "full" and held >= CFG["HOLD"] and temp < CFG["DOWN_BALANCE"]:
+        return "balance"
+    return level
+
+
+def run():
+    load_cfg()
+    level, since = "full", time.monotonic()
+    set_mode(level)  # start safe, curve steps down from here
+
+    def stop(*_):
+        # Leave the fan in a safe state when the daemon goes away.
+        try:
+            set_mode("full")
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    print(f"start: curve {CFG}", flush=True)
+    while True:
+        t = cpu_temp()
+        want = target(level, t, time.monotonic() - since)
+        if want != level:
+            set_mode(want)
+            print(f"{t:.0f}C: {level} -> {want} ({rpm()} rpm)", flush=True)
+            level, since = want, time.monotonic()
+        elif get_mode() != level:
+            # Something else (BIOS/SMI) changed it under us; re-assert.
+            set_mode(level)
+        time.sleep(CFG["INTERVAL"])
+
+
+def check_model():
+    # The ACPI paths and EC offsets are specific to this board's firmware.
+    try:
+        family = open("/sys/class/dmi/id/product_family").read().strip()
+    except OSError:
+        family = "unknown"
+    if family != "ThinkStation P3 Tiny Gen 2" and os.environ.get("P3_FANCURVE_FORCE") != "1":
+        sys.exit(f"unsupported machine ({family}); set P3_FANCURVE_FORCE=1 to override")
+
+
+def main():
+    global PKG_TEMP
+    check_model()
+    if not os.path.exists(CALL):
+        os.system("modprobe acpi_call")
+    PKG_TEMP = pkg_zone()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "run":
+        try:
+            run()
+        except Exception as e:
+            print(f"error: {e}; forcing full speed", file=sys.stderr, flush=True)
+            try:
+                set_mode("full")
+            finally:
+                sys.exit(1)
+    elif cmd == "set" and len(sys.argv) == 3 and sys.argv[2] in LEVELS:
+        set_mode(sys.argv[2])
+    elif cmd == "status":
+        print(f"mode={get_mode()} fan={rpm()}rpm cpu={cpu_temp():.0f}C ec_cpu={ec(0x01)}C")
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
