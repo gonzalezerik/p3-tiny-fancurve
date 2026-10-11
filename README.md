@@ -157,7 +157,7 @@ $ journalctl -u p3-fancurve   # start-up config and any safety override events
 | Daemon stopped cleanly (`systemctl stop`, package removal) | `auto` (EC's own curve) |
 | Daemon crashes or any ACPI call fails | `full`; systemd restarts it after 5 s |
 | Something else rewrites the flag byte | re-asserted within `INTERVAL` |
-| Boot, before the service starts | whatever state the BIOS/EC leaves it in (not yet verified whether the flag survives a reboot; the service sets it on start either way) |
+| Boot, before the service starts | `auto`: the firmware resets the flag to `0x1f` on every boot (verified with a warm reboot). The service starts about 5 s into boot and sets `LEVEL` again |
 
 The EC's own protections are untouched. The CPU still has its normal hardware
 thermal throttling and critical shutdown.
