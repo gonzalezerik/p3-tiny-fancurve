@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""Temperature-driven fan curve for the Lenovo ThinkStation P3 Tiny Gen 2.
+"""Fixed fan speed for the Lenovo ThinkStation P3 Tiny Gen 2.
 
-The fan is owned by the EC; Linux gets no PWM. The firmware does expose a
-runtime cooling-mode switch (WMI GUID 887B54F3-..., \\WMI2.WMG0 method 5),
-and the fan tach lives in EC RAM 0x09/0x0A.
-Both are reached through acpi_call so all EC access goes through the AML
-interpreter (no racing the firmware on ports 0x62/0x66).
+The fan belongs to the ITE EC; Linux gets no PWM. The EC's fan level is
+selected by a flag byte in its banked RAM (BRAM index 0x0e, reached through
+the firmware's own \\_SB.GBRM / \\_SB.SBRM methods via acpi_call). 0x1f is the
+EC's normal auto curve; clearing a single bit pins a fixed level:
 
-Measured 2026-10-10: "balance" and "performance" are both EC auto-curves that
-sit near ~900 rpm into the high 80s C; "full" is a fixed ~5970 rpm. No duty/PWM
-register is exposed (EC RAM and the 0xA50 bank only hold mode flags), so the
-curve is: EC quiet curve until UP_FULL, full speed until DOWN_BALANCE + HOLD.
+  low     0x1e  ~2,000 rpm
+  medium  0x0f  ~2,400 rpm
+  full    0x1d  ~5,970 rpm   (same as the BIOS "Full Speed" mode)
+  max     0x17  ~6,950 rpm
+  auto    0x1f  EC curve (~900 rpm until the CPU is in the 90s)
 
-  p3-fancurve run      daemon (systemd)
+Fan tach is EC RAM 0x09/0x0A, read through \\_SB.GECR.
+
+  p3-fancurve run      daemon (systemd): hold LEVEL, re-assert if changed
   p3-fancurve status   one-shot readout
-  p3-fancurve set {balance|performance|full}
+  p3-fancurve set {low|medium|full|max|auto}
 """
 import os, signal, sys, time
 
 CALL = "/proc/acpi/call"
-PKG_TEMP = None  # resolved at start: thermal zone of type x86_pkg_temp
-LEVELS = {"balance": 2, "performance": 3, "full": 4}
+FLAG = 0x0E
+LEVELS = {"low": 0x1E, "medium": 0x0F, "full": 0x1D, "max": 0x17, "auto": 0x1F}
 NAMES = {v: k for k, v in LEVELS.items()}
+PKG_TEMP = None  # resolved at start: thermal zone of type x86_pkg_temp
 
-# Go to full at >= UP_FULL; return to balance once below DOWN_BALANCE and full
-# has been held for HOLD seconds (keeps it from pumping every few seconds).
-CFG = {"UP_FULL": 80, "DOWN_BALANCE": 62, "HOLD": 300, "INTERVAL": 5}
+# LEVEL is held constantly. Only if the CPU reaches SAFETY_TEMP does the fan go
+# to full, and it returns to LEVEL once the CPU is back below SAFETY_CLEAR.
+CFG = {"LEVEL": "medium", "SAFETY_TEMP": 90, "SAFETY_CLEAR": 75, "INTERVAL": 5}
 
 
 def load_cfg():
@@ -33,11 +36,13 @@ def load_cfg():
         for line in open("/etc/default/p3-fancurve"):
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                if k.strip() in CFG:
-                    CFG[k.strip()] = int(v.strip())
+                k, v = (x.strip() for x in line.split("=", 1))
+                if k in CFG:
+                    CFG[k] = v if k == "LEVEL" else int(v)
     except FileNotFoundError:
         pass
+    if CFG["LEVEL"] not in LEVELS:
+        raise ValueError(f"LEVEL must be one of {', '.join(LEVELS)}")
 
 
 def acpi(expr):
@@ -58,12 +63,12 @@ def rpm():
     return (ec(0x0A) << 8) | ec(0x09)
 
 
-def get_mode():
-    return NAMES.get(acpi("\\WMI2.WMG0 0 6 0"), "unknown")
+def get_flag():
+    return acpi(f"\\_SB.GBRM 0x{FLAG:02x}")
 
 
-def set_mode(name):
-    acpi(f"\\WMI2.WMG0 0 5 {LEVELS[name]}")
+def set_level(name):
+    acpi(f"\\_SB.SBRM 0x{FLAG:02x} 0x{LEVELS[name]:02x}")
 
 
 def pkg_zone():
@@ -81,39 +86,33 @@ def cpu_temp():
     return int(open(PKG_TEMP).read()) / 1000
 
 
-def target(level, temp, held):
-    if temp >= CFG["UP_FULL"]:
-        return "full"
-    if level == "full" and held >= CFG["HOLD"] and temp < CFG["DOWN_BALANCE"]:
-        return "balance"
-    return level
-
-
 def run():
     load_cfg()
-    level, since = "full", time.monotonic()
-    set_mode(level)  # start safe, curve steps down from here
+    set_level(CFG["LEVEL"])
+    hot = False
 
     def stop(*_):
-        # Leave the fan in a safe state when the daemon goes away.
+        # Clean stop: hand the fan back to the EC's own curve.
         try:
-            set_mode("full")
+            set_level("auto")
         finally:
             sys.exit(0)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    print(f"start: curve {CFG}", flush=True)
+    print(f"start: {CFG}", flush=True)
     while True:
         t = cpu_temp()
-        want = target(level, t, time.monotonic() - since)
-        if want != level:
-            set_mode(want)
-            print(f"{t:.0f}C: {level} -> {want} ({rpm()} rpm)", flush=True)
-            level, since = want, time.monotonic()
-        elif get_mode() != level:
-            # Something else (BIOS/SMI) changed it under us; re-assert.
-            set_mode(level)
+        if not hot and t >= CFG["SAFETY_TEMP"]:
+            hot = True
+            print(f"{t:.0f}C: safety override, full speed", flush=True)
+        elif hot and t < CFG["SAFETY_CLEAR"]:
+            hot = False
+            print(f"{t:.0f}C: back to {CFG['LEVEL']}", flush=True)
+        level = "full" if hot and CFG["LEVEL"] not in ("full", "max") else CFG["LEVEL"]
+        if get_flag() != LEVELS[level]:
+            # The BIOS/EC rewrote the flag byte (e.g. after a mode change); re-assert.
+            set_level(level)
         time.sleep(CFG["INTERVAL"])
 
 
@@ -140,13 +139,14 @@ def main():
         except Exception as e:
             print(f"error: {e}; forcing full speed", file=sys.stderr, flush=True)
             try:
-                set_mode("full")
+                set_level("full")
             finally:
                 sys.exit(1)
     elif cmd == "set" and len(sys.argv) == 3 and sys.argv[2] in LEVELS:
-        set_mode(sys.argv[2])
+        set_level(sys.argv[2])
     elif cmd == "status":
-        print(f"mode={get_mode()} fan={rpm()}rpm cpu={cpu_temp():.0f}C ec_cpu={ec(0x01)}C")
+        flag = get_flag()
+        print(f"level={NAMES.get(flag, hex(flag))} fan={rpm()}rpm cpu={cpu_temp():.0f}C")
     else:
         print(__doc__)
         sys.exit(2)

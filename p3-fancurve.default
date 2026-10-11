@@ -1,7 +1,8 @@
-# p3-fancurve: EC quiet curve (~900 rpm) until UP_FULL, then full speed
-# (~5970 rpm) until below DOWN_BALANCE after at least HOLD seconds.
-# Temperatures are CPU package deg C. Restart the service after editing.
-UP_FULL=80
-DOWN_BALANCE=62
-HOLD=300
+# p3-fancurve: fixed fan level. low ~2000 rpm, medium ~2400, full ~5970,
+# max ~6950, auto = EC's own curve. If the CPU package reaches SAFETY_TEMP the
+# fan goes to full until it is back below SAFETY_CLEAR (deg C).
+# Restart the service after editing.
+LEVEL=medium
+SAFETY_TEMP=90
+SAFETY_CLEAR=75
 INTERVAL=5

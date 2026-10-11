@@ -9,42 +9,52 @@ even with the CPU at 90 °C+; "Full Speed" is a fixed ~5,970 rpm. The only
 documented way to change between them is the BIOS setup screen (or `think-lmi`),
 and that needs a reboot.
 
-This project uses a cooling-mode method the firmware exposes over WMI to switch
-modes **at runtime**, reads the real fan RPM out of EC RAM, and runs a small
-temperature-driven curve on top.
+The EC does have fixed fan levels. They're selected by a flag byte in its
+banked RAM, which the firmware's own ACPI methods can read and write. This
+project pins the fan to one of those levels, so it runs at a **constant**
+speed, and keeps it there.
 
 ## What it does
 
-| CPU package temp | Fan |
-|---|---|
-| below `UP_FULL` (80 °C) | EC quiet curve (~900 rpm) |
-| reaches `UP_FULL` | full speed (~5,970 rpm) |
-| full speed held ≥ `HOLD` (300 s) **and** below `DOWN_BALANCE` (62 °C) | back to the quiet curve |
+| Level | Flag (BRAM `0x0e`) | Fan |
+|---|---|---|
+| `low` | `0x1e` | ~2,000 rpm, steady |
+| `medium` (default) | `0x0f` | ~2,400 rpm, steady |
+| `full` | `0x1d` | ~5,970 rpm (same as BIOS "Full Speed") |
+| `max` | `0x17` | ~6,950 rpm |
+| `auto` | `0x1f` | the EC's own curve (~900 rpm into the 90s °C) |
 
-If the daemon exits, is stopped, or hits any error, it leaves the fan at full
-speed. After a reboot the EC starts in whatever mode the BIOS has stored until
-the service comes up.
+The daemon sets `LEVEL` and re-asserts it if the firmware ever rewrites the
+byte. The fan doesn't cycle. Only if the CPU package reaches `SAFETY_TEMP`
+(90 °C) does it go to full speed, returning to `LEVEL` below `SAFETY_CLEAR`
+(75 °C).
+
+A clean stop hands the fan back to the EC's curve (`auto`). A crash or error
+leaves it at full speed.
 
 ### Measured on a 30K60008US (Core Ultra 9 285, BIOS M5PKT32A, EC 0.1.12)
 
-| Mode | Fan | CPU package at ~20 W |
-|---|---|---|
-| Balance (EC) | ~900 rpm | ~91 °C |
-| Performance (EC) | ~900 rpm until very hot | ~88 °C |
-| Full Speed (EC) | ~5,970 rpm | ~47–55 °C |
+| Fan | CPU package at ~20 W sustained |
+|---|---|
+| EC auto (Balance), ~900 rpm | ~91 °C |
+| `medium`, ~2,400 rpm | ~58 °C (held 3 min, flag never overwritten) |
+| `full`, ~5,970 rpm | ~47–55 °C |
 
-Switching Balance → Full at runtime took the CPU from 93 °C to 69 °C in 40 s.
+`medium` gets most of the cooling of full speed at well under half the rpm.
 
 ## Limitations
 
-- **Two speeds, not a continuous curve.** "Balance" and "Performance" are both
-  EC auto-curves that stay quiet into the high 80s; "Full Speed" is fixed. No
-  fan-duty register is reachable: the 256-byte EC RAM page and the 0xA50/0xA51
-  bank were dumped in each mode and only a mode-flag bit changes. The EC
-  computes duty internally.
-- **One model.** The ACPI paths and EC offsets come from this board's DSDT. The
-  script refuses to run unless DMI says `ThinkStation P3 Tiny Gen 2`
+- **Five levels, not arbitrary rpm.** Each level is a fixed duty the EC picks
+  from that flag byte. Clearing bit 2 (`0x1b`) gives 3,000–3,600 rpm, but it
+  drifts with temperature, so it isn't offered. No raw PWM register is
+  reachable. The ACPI EC page (all 256 bytes, write-tested), the BRAM bank and
+  the PMC2 page were all checked. The ITE "D2EC" back door is disabled by the
+  firmware, and the EC firmware image in Lenovo's BIOS package is encrypted.
+- **One model.** The ACPI paths and offsets come from this board's firmware.
+  The script refuses to run unless DMI says `ThinkStation P3 Tiny Gen 2`
   (`P3_FANCURVE_FORCE=1` overrides; only do that after reading your own tables).
+  The same BIOS package covers the ThinkCentre M90q Gen 6 and Neo Ultra Gen 2,
+  which may share the EC, but that's untested.
 - Tested on Proxmox VE 9 (Debian trixie), kernel 7.0.
 
 ## Install
@@ -56,7 +66,7 @@ Debian / Proxmox package:
 
 ```sh
 make deb
-apt install ./build/p3-fancurve_0.1.0_all.deb
+apt install ./build/p3-fancurve_0.2.0_all.deb
 ```
 
 Or directly:
@@ -66,14 +76,14 @@ sudo make install            # PREFIX=/usr/local by default
 sudo systemctl enable --now p3-fancurve
 ```
 
-Thresholds live in `/etc/default/p3-fancurve`; restart the service after
+`LEVEL` and the safety thresholds live in `/etc/default/p3-fancurve`; restart the service after
 editing.
 
 ```console
 $ p3-fancurve status
-mode=balance fan=876rpm cpu=71C ec_cpu=71C
-$ p3-fancurve set full        # manual override (the daemon will re-assert its own choice)
-$ journalctl -u p3-fancurve   # every mode change is logged with temp and rpm
+level=medium fan=2393rpm cpu=58C
+$ p3-fancurve set low         # manual override (the daemon re-asserts LEVEL within 5 s)
+$ journalctl -u p3-fancurve   # safety overrides are logged with the temperature
 ```
 
 ## How it works
@@ -109,7 +119,38 @@ All reads go through `\_SB.GECR` via `acpi_call`, so they're serialized by the
 ACPI interpreter instead of racing the firmware's own EC traffic on the raw
 ports.
 
+### The fan-level flag
+
+The EC is an ITE part (Super I/O ID `0x5652` behind the standard ITE entry key
+on 0x2E). Its BRAM bank at 0xA50/0xA51 is wrapped by the DSDT as
+`\_SB.GBRM(idx)` / `\_SB.SBRM(idx, val)`. Byte `0x0e` reads `0x1f` under the
+EC's normal curve. Switching the cooling mode to Full Speed (below) clears
+bit 1 (`0x1d`). Clearing other single bits pins other fixed levels:
+
+| Bit cleared | Value | Fan |
+|---|---|---|
+| 0 | `0x1e` | ~2,000 rpm |
+| 1 | `0x1d` | ~5,970 rpm |
+| 2 | `0x1b` | 3,000–3,600 rpm, temperature-dependent |
+| 3 | `0x17` | ~6,950 rpm |
+| 4 | `0x0f` | ~2,400 rpm |
+
+The EC ramps between levels over 10–20 s, so changing level is smooth. The
+EC didn't touch the byte while a level was held. The daemon still checks it
+every `INTERVAL` seconds in case BIOS code rewrites it.
+
+By hand:
+
+```sh
+modprobe acpi_call
+echo '\_SB.SBRM 0x0e 0x0f' > /proc/acpi/call   # ~2,400 rpm
+echo '\_SB.SBRM 0x0e 0x1f' > /proc/acpi/call   # back to the EC curve
+```
+
 ### The runtime mode switch
+
+The daemon doesn't use this (the level flag above is finer-grained). It's
+documented because it's how the BIOS cooling modes are applied at runtime.
 
 `\WMI2` (`PNP0C14`) registers method object `G0` under
 **`887B54F3-DDDC-4B2C-8B88-68A26A8835D0`**, implemented by `WMG0`:

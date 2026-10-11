@@ -1,6 +1,6 @@
 PREFIX ?= /usr/local
 SBINDIR = $(PREFIX)/sbin
-VERSION = 0.1.0
+VERSION = 0.2.0
 DEB = build/p3-fancurve_$(VERSION)_all.deb
 
 .PHONY: install uninstall deb clean

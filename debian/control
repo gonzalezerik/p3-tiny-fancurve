@@ -6,7 +6,7 @@ Depends: python3, acpi-call-dkms
 Section: admin
 Priority: optional
 Homepage: https://github.com/gonzalezerik/p3-tiny-fancurve
-Description: Fan curve for the Lenovo ThinkStation P3 Tiny Gen 2
- Switches the embedded controller between its quiet curve and full speed
- based on CPU package temperature, using the firmware's runtime cooling-mode
- WMI method, and reads fan RPM from EC RAM. Fails safe to full speed.
+Description: Fixed fan speed for the Lenovo ThinkStation P3 Tiny Gen 2
+ Pins the embedded controller's fan to a constant level (about 2000, 2400,
+ 5970 or 6950 rpm) by setting its fan-level flag byte through the firmware's
+ own ACPI methods, with a full-speed safety override on high CPU temperature.

@@ -1,5 +1,5 @@
 [Unit]
-Description=ThinkStation P3 Tiny Gen 2 fan curve (EC cooling mode via WMI)
+Description=ThinkStation P3 Tiny Gen 2 fixed fan speed (EC level via ACPI)
 After=systemd-modules-load.service
 
 [Service]
